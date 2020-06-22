@@ -34,12 +34,50 @@ SUCH DAMAGE.
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#ifdef USEMPI
+#include <mpi.h>
+#endif
 
 #include "sock.h"
 
+/* #define DEBUG */
+
 #define SEND_MAX 65536
 #define RECV_MAX 1024
+#define DATA_TYPE MPI_CHAR
+#define DATA_TAG  0
 
+static char *mpirecv_buf = NULL;
+static int mpirecv_buf_size = 0;
+static int mpirecv_buf_len = 0;
+static int mpirecv_buf_start = 0;
+int *mpisend_buf_len;           /* ptr to length of the current buffer */
+static int *mpisend_buf_size;   /* ptr to capacity of the current buffer */
+
+struct send_block
+{
+    char *buf; // ���M����f�[�^
+    int len;   // buf�ɓ����Ă���f�[�^�̑傫��
+    int size;  // buf�Ɋm�ۂ��ꂽ�q�[�v�T�C�Y
+    int rank;  // ���M��rank
+};
+
+__thread struct send_block *sq = NULL;
+static pthread_mutex_t send_lock;
+
+struct recv_block
+{
+    char *buf; // ���M����f�[�^
+    int len;   // buf�ɓ����Ă���f�[�^�̑傫��
+    int size;  // buf�Ɋm�ۂ��ꂽ�q�[�v�T�C�Y
+    struct recv_block *next;
+};
+// recieve queue
+static struct recv_block *recv_queue_head = NULL;
+static struct recv_block *recv_queue_tail = NULL;
+static struct recv_block *recv_queue_temp = NULL;
+static pthread_mutex_t recv_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t recv_cond;
 /* SunOS does not support vasprintf() */
 #ifdef NO_VASPRINTF
 #define VSNPRINTF_LEN 1000
@@ -49,8 +87,6 @@ SUCH DAMAGE.
    before reading a sokcet/stdin (until receive_buf_p points the end of the string) */
 char *receive_buf = 0;
 char *receive_buf_p = 0;
-
-/* #define DEBUG */
 
 #ifdef DEBUG
 int dbg_printf (char *fmt_string, ...)
@@ -96,31 +132,58 @@ int dbg_printf (char *fmt_string, ...)
 
 #endif
 
+// Prepare for adding a message to the send queue.
+void send_block_start (void)
+{
+    sq = (struct send_block*)malloc(sizeof(struct send_block));
+    sq->buf = malloc(sizeof(char)*32768);
+    sq->len = 0;
+    sq->size = 32768;
+}
+
+// Finish adding the message to the send queue.
+void send_block_end(int rank)
+{
+    MPI_Send(sq->buf, sq->len, MPI_CHAR, rank, 0, MPI_COMM_WORLD);
+    free(sq->buf);
+    free(sq);
+}
+
+// Append contents in buf whose length is len to *mpisend_buf
+int
+append_to_mpisend_buf(const void *buf, int len)
+{
+    int ns = len + sq->len;
+    if (ns > sq->size)
+    {
+        sq->buf = realloc(sq->buf, ns+1);
+        if (sq->buf == NULL)
+        {
+            fprintf(stderr, "Error: Not enough memory.\n");
+            exit(1);
+        }
+        sq->size = ns+1;
+    }
+    memcpy(sq->buf+sq->len, buf, len);
+    sq->len = ns;
+}
+
 /* send */
 int send_char (char ch, int socket)
 {
-    if (socket<0)
-        return putc (ch, stdout);
-    else
-        {
 #ifdef DEBUG
-            dbg_printf ("send_char: '%s' (%d)", (char[]){ch,0}, ch);
+  dbg_printf ("send_char: '%s' (%d)", (char[]){ch,0}, ch);
 #endif
-        return send (socket, &ch, 1, 0);
-        }
+  append_to_mpisend_buf ((char[]){ch,0}, 1);
 }
 
 int send_string (char *str, int socket)
 {
-    if (socket<0)
-        return fputs (str, stdout);
-    else
-        {
 #ifdef DEBUG
-            dbg_printf ("send_string: %s", str);
-#endif
-            return send (socket, str, strlen(str), 0);
-        }
+  dbg_printf ("send_string: %s", str);
+#endif           // MPI
+  append_to_mpisend_buf (str, strlen(str));
+  return 0;
 }
 int send_fmt_string (int socket, char *fmt_string, ...)
 {
@@ -133,14 +196,14 @@ int send_fmt_string (int socket, char *fmt_string, ...)
     int len;
     int ret;
 
-    if (socket<0)
+    if (socket == 0) // stdout
         {
             va_start (args, fmt_string);
             len = vprintf (fmt_string, args);
             va_end (args);
             return len;
         }
-    else
+    else             // MPI or TCP/IP
         {
             va_start (args, fmt_string);
 #ifdef NO_VASPRINTF
@@ -153,7 +216,13 @@ int send_fmt_string (int socket, char *fmt_string, ...)
 #ifndef NO_VASPRINTF
             if (str == NULL) { perror ("allocation"); exit (1); }
 #endif
-            ret = send (socket, str, len, 0);
+	    if (socket<0) { // MPI
+	      append_to_mpisend_buf (str, len);
+	      ret = 0;
+	    }
+	    else {          // TCP/IP
+	      ret = send (socket, str, len, 0);
+	    }
 #ifdef DEBUG
             dbg_printf ("send_fmt_string: %s", str);
 #endif
@@ -167,39 +236,50 @@ int send_fmt_string (int socket, char *fmt_string, ...)
 int send_binary (void *src, unsigned long elm_size, unsigned long n_elm,
                  int socket)
 {
-    if (socket<0)
-        {
-            return fwrite (src, elm_size, n_elm, stdout);
-        }
-    else
-        {
-            unsigned long rest=elm_size*n_elm;
-            unsigned long ret;
-            while (rest>0) {
-                ret = send (socket, src,
-                            (rest>SEND_MAX)?SEND_MAX:rest,
-                            0);
-                if (ret<0)
-                    { perror ("send_binary"); exit (1); }
-                rest -= ret;
-                src += ret;
-#ifdef DEBUG
-                dbg_printf ("send_binary: %ld bytes", ret);
-#endif
-            }
-            return n_elm;
-        }
+  append_to_mpisend_buf (src, elm_size*n_elm);
+  return 0;
+}
+
+/* Print contents of *mpisend_buf to stderr */
+void show_mpisend_buf (int socket) {
+  if (socket < 0) { // MPI
+    sq->buf[sq->len-1] = 0;
+    fprintf (stderr, "%s\n", sq->buf);
+  }
+  /* do nothing unless MPI mode */
 }
 
 /* receive */
+/* Get contents of the length len from mpirecv_buf */
+static ssize_t
+get_from_mpirecv_buf (void *buf, int len)
+{
+    int rest = len;
+    int cpylen;
+
+    for (;;)
+    {
+        cpylen = (mpirecv_buf_len < rest) ? mpirecv_buf_len : rest;
+        if (cpylen > 0)
+        {
+            memcpy(buf, mpirecv_buf + mpirecv_buf_start, cpylen);
+            buf += cpylen;
+            mpirecv_buf_start += cpylen;
+            mpirecv_buf_len -= cpylen;
+            rest -= cpylen;
+        }
+        if (rest == 0) return len;
+    }
+}
+
 /* Invoke recv() repeatedly to read len characters */
-ssize_t recv2 (int s, void *buf, size_t len, int flags)
+ssize_t recv2 (int socket, void *buf, size_t len, int flags)
 {
     size_t rest=len;
     ssize_t ret;
     while (rest>0)
         {
-            ret = recv (s, buf, (rest>RECV_MAX) ? RECV_MAX : rest, flags);
+            ret = recv (socket, buf, (rest>RECV_MAX) ? RECV_MAX : rest, flags);
             if (ret<0)
                 { perror ("recv2"); exit(1); }
             buf += ret;
@@ -210,30 +290,27 @@ ssize_t recv2 (int s, void *buf, size_t len, int flags)
 
 int receive_char (int socket)
 {
-    char buf;
-    int ret;
-
-    if (receive_buf) {
-      if ( *receive_buf_p )
-        return ( *(receive_buf_p++) );
-      else {
-        /* Finished reading receive_buf */
-        receive_buf = 0;
-      }
-    } 
-    if (socket<0)
-        {
-            return fgetc (stdin);
-        }
-    else
-        {
-            ret=recv2 (socket, &buf, 1, 0);
+  char buf;
+  int ret;
+   
+  if (socket<0)       // MPI
+    {
+      get_from_mpirecv_buf (&buf, sizeof(char));
+      return buf;
+    }
+  else if (socket==0) // stdin
+    {
+      return fgetc (stdin);
+    }
+  else                // TCP/IP
+    {
+      ret=recv2 (socket, &buf, 1, 0);
 #ifdef DEBUG
-            dbg_printf ("receive_char: '%s' (%d)", (char[]){buf,0}, buf);
+      dbg_printf ("receive_char: '%s' (%d)", (char[]){buf,0}, buf);
 #endif
-            if (ret <= 0) return EOF;
-            else return buf;
-        }
+      if (ret <= 0) return EOF;
+      else return buf;
+    }
 }
 
 char* receive_line (char *buf, int maxlen, int socket)
@@ -242,76 +319,77 @@ char* receive_line (char *buf, int maxlen, int socket)
     int ret;
     int i;
 
-    if (receive_buf) {
-      if ( *receive_buf_p ) {
-        for (i=0 ; i<maxlen-1 ; i++) {
-          if ( *receive_buf_p == '\n' ) {
-            receive_buf_p++;
-            break;
-          } else if ( *receive_buf_p == 0 ) {
-            break;
-          } else {
-            buf[i] = *receive_buf_p;
-            receive_buf_p++;
-          }
-        }
-        buf[i] = '\0';
-        return buf;
+    if (socket<0)  // MPI
+      {
+	for (i = 0; i < maxlen-1; i++)
+	  {
+	    ret = get_from_mpirecv_buf (&ch, sizeof(char));
+	    if (ret <= 0)
+	      {
+		perror("receive_line");
+		return NULL;
+	      }
+	    else
+	      {
+		buf[i]=ch;
+		if (ch == '\n') { i++; break; }
+	      }
+	  }
+	buf[i]='\0';
+	return buf;
       }
-      else {
-        /* Finished reading receive_buf */
-        receive_buf = 0;
+    if (socket==0) // stdin
+      {
+	return fgets (buf, maxlen, stdin);
       }
-    } 
-    if (socket<0)
-        {
-            return fgets (buf, maxlen, stdin);
-        }
-    else
-        {
-            for (i=0; i<maxlen-1 ; i++) {
-                ret=recv2 (socket, &ch, 1, 0);
-                if (ret <= 0)
-                    {
-                        perror ("receive_line");
-                        return NULL;
-                    }
-                else
-                    {
-                        buf[i]=ch;
-                        if (ch == '\n') { i++; break; }
-                    }
-            }
-            buf[i]='\0';
+    else           // TCP/IP
+      {
+	for (i=0; i<maxlen-1 ; i++) {
+	  ret=recv2 (socket, &ch, 1, 0);
+	  if (ret <= 0)
+	    {
+	      perror ("receive_line");
+	      return NULL;
+	    }
+	  else
+	    {
+	      buf[i]=ch;
+	      if (ch == '\n') { i++; break; }
+	    }
+	}
+	buf[i]='\0';
 #ifdef DEBUG
-            dbg_printf ("receive_line: %s", buf);
+	dbg_printf ("receive_line: %s", buf);
 #endif
-            return buf;
-        }
+	return buf;
+      }
 }
 
 int receive_binary (void *dst, unsigned long elm_size, unsigned long n_elm,
                     int socket)
 {
-    if (receive_buf) {
-      perror ("receive_binary to receive_buf");
-    }
-    if (socket<0)
-        {
-            return fread (dst, elm_size, n_elm, stdin);
-        }
-    else
-        {
-            int i;
-            for (i=0; i<elm_size ; i++)
-                {
-                    dst += recv2 (socket, dst, n_elm, 0);
+
+    if (socket<0)  // MPI
+      {
+	get_from_mpirecv_buf (dst, n_elm*elm_size);
+	return n_elm;
+      }
+    if (socket==0) // stdin
+      {
+	return fread (dst, elm_size, n_elm, stdin);
+      }
+    else           // TCP/IP
+      {
+	int i;
+	for (i=0; i<elm_size ; i++)
+	  {
+	    dst += recv2 (socket, dst, n_elm, 0);
 #ifdef DEBUG
-                    dbg_printf ("receive_binary: %ld bytes", n_elm);
+	    dbg_printf ("receive_binary: %ld bytes", n_elm);
 #endif
-                }
-            return n_elm;
-        }
+	  }
+	return n_elm;
+      }
 }
 
 
@@ -362,6 +440,69 @@ void close_socket (int socket)
     close (socket);
 }
 
+// message processing thread func
+void msg_func()
+{
+    struct recv_block *rq = NULL;
+    for(;;)
+    {
+        pthread_mutex_lock(&recv_lock);
+        pthread_cond_wait(&recv_cond, &recv_lock);
+        do{
+            if (recv_queue_head != NULL)
+            {
+                rq = recv_queue_head;
+                recv_queue_head = rq->next;
+                if (rq->next == NULL) recv_queue_tail = NULL;
+                mpirecv_buf_len = rq->len;
+                mpirecv_buf = rq->buf;
+                mpirecv_buf_start = 0;
+                pthread_mutex_unlock(&recv_lock);
+                proc_msg();
+                free(rq->buf);
+                free(rq);
+                pthread_mutex_lock(&recv_lock);
+            } else{
+                pthread_mutex_unlock(&recv_lock);
+                break;
+            }
+        }while(1);
+    }
+}
+
+// Infinite loop for messaging thread in MPI mode
+void sendrecv()
+{
+    MPI_Status send_status, recv_status;
+    MPI_Request req;
+    int sflag, rflag;
+    int sent;
+    int readlen;
+    pthread_t msg_thread;
+    pthread_create(&msg_thread, NULL, (void *)msg_func, NULL);
+
+    for (sent = 0;;)
+    {
+        MPI_Probe(MPI_ANY_SOURCE, DATA_TAG, MPI_COMM_WORLD, &recv_status);
+        MPI_Get_count(&recv_status, DATA_TYPE, &readlen);
+        recv_queue_temp = (struct recv_block *) malloc(sizeof(struct recv_block));
+        recv_queue_temp->buf = (char *) malloc(sizeof(char) * readlen);
+        recv_queue_temp->len = readlen;
+        recv_queue_temp->next = NULL;
+        MPI_Recv(recv_queue_temp->buf, recv_queue_temp->len, DATA_TYPE, recv_status.MPI_SOURCE,
+                DATA_TAG, MPI_COMM_WORLD, &recv_status);
+        
+        // recv queueに入れる
+        pthread_mutex_lock(&recv_lock);
+        {
+          if (recv_queue_head == NULL) recv_queue_head = recv_queue_temp;
+          if (recv_queue_tail != NULL) recv_queue_tail->next = recv_queue_temp;
+          recv_queue_tail = recv_queue_temp;
+        }
+        pthread_cond_signal(&recv_cond);
+        pthread_mutex_unlock(&recv_lock);
+    }
+}
 /* test */
 #ifdef TEST
 int main (int argc, char **argv)
@@ -380,3 +521,4 @@ int main (int argc, char **argv)
     close_socket (socket);
 }
 #endif
+

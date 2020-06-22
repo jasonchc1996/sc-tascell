@@ -5,16 +5,19 @@ SC2C=sc2c
 SC2C_OPT=
 # SC2C_OPT+=-m              # don't remove intermediate files
 # SC2C_OPT+=-D DEBUG=0      # invalidate debugging code
-# SC2C_OPT+=-D NO-EXCEPTION # invalidate exception support
+SC2C_OPT+=-D USEMPI=1       # validate MPI
+SC2C_OPT+=-D NO-EXCEPTION # invalidate exception support
 SC2C_OPT+=-D PROFILE        # validate profiling
 # Command for XC Cube (an extended GCC that supports L-Closures and Closures)
 XCC=xcc
 # Command for gcc
 GCC=gcc #$(XCC)
+GCC=mpiicc
 # Command for Intel C Compiler
 ICC=icc
 # Optimization options for C Compilers
 OPT=-O3 -g $(MOPT)
+OPT+=-D USEMPI
 
 # Keyword for L-Closures and Closures in XC Cube. Don't modify.
 XCCOPT=-DCT=lightweight

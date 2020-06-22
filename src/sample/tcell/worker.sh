@@ -1,4 +1,4 @@
-;;; Copyright (c) 2009-2016 Tasuku Hiraishi <tasuku@media.kyoto-u.ac.jp>
+;;; Copyright (c) 2009-2020 Tasuku Hiraishi <tasuku@media.kyoto-u.ac.jp>
 ;;; All rights reserved.
 
 ;;; Redistribution and use in source and binary forms, with or without
@@ -27,6 +27,9 @@
 (%defconstant VERBOSE 1)
 (%include "dprint.sh")
 
+;;; Support MPI?
+(%defconstant USEMPI 1)
+
 ;;; Implementation of nested functions
 (%ifndef* NF-TYPE
   (%defconstant NF-TYPE GCC))           ; one of GCC LW-SC CL-SC XCC XCCCL
@@ -54,7 +57,8 @@
 ;; (%defconstant BUSYWAIT)
 
 ;; Declarations for external communication functionalities
-(%cinclude "sock.h" (:macro))
+;;(%cinclude "sock.h" (:macro))
+(c-exp "#include \"sock.h\"")
 
 ;;;; Declarations
 ;; Special elements for address.
@@ -77,6 +81,16 @@
 (static choose-strings (array (ptr char))
   (array "CHS-RANDOM" "CHS-ORDER"))
 (%defconstant NKIND-CHOOSE 2)           ; # of kinds of (enum choose)
+
+;; Kind of affinity
+(def (enum Affinity) COMPACT SCATTER SHAREDMEMORY)
+
+;; A send msg struct
+(def (struct send-block)
+  (def buf (ptr char))
+  (def len int)
+  (def size int)
+  (def rank int))
 
 ;; A message transferred among workers.
 (def (struct cmd)
@@ -106,8 +120,10 @@
       (array (ptr (fn void (ptr (struct thread-data)) (ptr void))) TASK-MAX))
 (extern-decl task-senders
       (array (ptr (csym::fn void (ptr void))) TASK-MAX))
-(extern-decl task-receivers
+(extern-decl task-allocators
       (array (ptr (csym::fn (ptr void))) TASK-MAX))
+(extern-decl task-receivers
+      (array (ptr (csym::fn void (ptr void))) TASK-MAX))
 (extern-decl rslt-senders
       (array (ptr (csym::fn void (ptr void))) TASK-MAX))
 (extern-decl rslt-receivers
@@ -182,17 +198,35 @@
 	 "TCOUNTER-TREQ-BK" "TCOUNTER-TREQ-ANY"))
 
 ;;; Kinds of events (for profiling)
-(%defconstant NKIND-EV 6)
+(%defconstant NKIND-EV 12)
 (def (enum event)
-  EV-SEND-TASK                          ; task send (aux: recipient)
-  EV-STRT-TASK                          ; task start (aux: task sender)
-  EV-RSLT-TASK                          ; task finished normally (aux: rslt recipient)
-  EV-EXCP-TASK                          ; task finished with an exce[tion (aux: rslt recipient)
-  EV-ABRT-TASK                          ; task aborted (aux: rslt recipient)
-  EV-SEND-CNCL                          ; send cncl (aux: recipient)
+  EV-SEND-TASK-INSIDE                   ; task send to a worker in the same node (aux: recipient)
+  EV-SEND-TASK-OUTSIDE                  ; task send to a worker in an external node (aux: recipient)
+  EV-STRT-TASK-INSIDE                   ; start task from the same node (aux: task sender)
+  EV-STRT-TASK-OUTSIDE                  ; start task from an exernal node (aux: task sender)
+  EV-RSLT-TASK-INSIDE                   ; normally finish task from the same node (aux: task sender)
+  EV-RSLT-TASK-OUTSIDE                  ; normally finish task from an external node (aux: rslt recipient)
+  EV-EXCP-TASK-INSIDE                   ; finish task from the same node with an exception (aux: task sender)
+  EV-EXCP-TASK-OUTSIDE                  ; finish task from an external node with an exception (aux: task sender)
+  EV-ABRT-TASK-INSIDE                   ; aborted task from the same node (aux: rslt recipient)
+  EV-ABRT-TASK-OUTSIDE                  ; aborted task from an external node (aux: rslt recipient)
+  EV-SEND-CNCL-INSIDE                   ; send cncl to a worker in the same node (aux: recipient)
+  EV-SEND-CNCL-OUTSIDE                  ; send cncl to a worker in an external node (aux: recipient)
   )
 (static ev-strings (array (ptr char))
-  (array "EV-SEND-TASK" "EV-STRT-TASK" "EV-RSLT-TASK" "EV-EXCP-TASK" "EV-ABRT-TASK" "EV-SEND-CNCL"))
+  (array "EV-SEND-TASK-INSIDE"
+         "EV-SEND-TASK-OUTSIDE"
+         "EV-STRT-TASK-INSIDE"
+         "EV-STRT-TASK-OUTSIDE"
+         "EV-RSLT-TASK-INSIDE"
+         "EV-RSLT-TASK-OUTSIDE"
+         "EV-EXCP-TASK-INSIDE"
+         "EV-EXCP-TASK-OUTSIDE"
+         "EV-ABRT-TASK-INSIDE"
+         "EV-ABRT-TASK-OUTSIDE"
+         "EV-SEND-CNCL-INSIDE"
+         "EV-SEND-CNCL-OUTSIDE"
+         ))
 
 ;;; Obj types of auxiliary data
 (def (enum obj-type)
@@ -352,6 +386,7 @@
  (decl (csym::evcounter-count)
      (fn int (ptr (struct thread-data)) (enum event) (enum obj-type) (ptr void)))
  (decl (csym::show-counters) (fn void))
+ (decl (csym::finalize-tcounter) (fn void))
  )
 
 ;;;; Declarations of functions in cmd-serial.sc
@@ -370,12 +405,15 @@
   (def num-thrs int)                    ; # of workers
   (def sv-hostname (ptr char))          ; hostname of connecting Tascell server
                                         ; If the string is "", external messages are output to stdout
-  (def port unsigned-short)             ; port # used to connect to Tascell server
+  (def port int)                        ; port # used to connect to Tascell server
   (def node-name (ptr char))            ; node name (used for debugging only)
   (def initial-task (ptr char))         ; string for arguments of initial task
   (def auto-exit int)                   ; When true, the process exits after sending external rslt message
   (def affinity int)                    ; use sched_setaffinity to assign a physical core/thread to each worker
   (def always-flush-accepted-treq int)  ; flush stealing back (accepted) treq message
+  (def thread-affinity (enum Affinity)) ; worker-thread affinity
+  (def cpu-num int)                     ; # cores / physical node
+  (def thread-per-cpu int)              ; # threads / core
   (def verbose int)                     ; verbose level
   (PROF-CODE                            
    (def timechart-file (ptr char)))     ; postfix of timechart output file names
